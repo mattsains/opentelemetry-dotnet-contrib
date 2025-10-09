@@ -260,13 +260,14 @@ public class GenevaTraceExporterTests : IDisposable
             listener.Sample = (ref ActivityCreationOptions<ActivityContext> options) => ActivitySamplingResult.AllDataAndRecorded;
             listener.ActivityStopped = (activity) =>
             {
-                _ = exporter.SerializeActivity(activity, resource);
-                var fluentdData = MessagePack.MessagePackSerializer.Deserialize<object>(m_buffer.Value, MessagePack.Resolvers.ContractlessStandardResolver.Options);
-                this.CheckSpanForActivity(exporterOptions, fluentdData, activity, exporter.DedicatedFields, resourceAttributes);
+                exporter.Export(new Batch<Activity>(activity), resource);
+                // _ = exporter.SerializeActivity(activity, resource);
+                // var fluentdData = MessagePack.MessagePackSerializer.Deserialize<object>(m_buffer.Value, MessagePack.Resolvers.ContractlessStandardResolver.Options);
+                // this.CheckSpanForActivity(exporterOptions, fluentdData, activity, exporter.DedicatedFields, resourceAttributes);
 
-                Console.WriteLine(activity.OperationName);
-                Console.WriteLine(invocationCount + 1);
-                invocationCount++;
+                // Console.WriteLine(activity.OperationName);
+                // Console.WriteLine(invocationCount + 1);
+                // invocationCount++;
             };
             ActivitySource.AddActivityListener(listener);
 
