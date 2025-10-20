@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using BenchmarkDotNet.Attributes;
 using OpenTelemetry.Exporter.Geneva.MsgPack;
 using OpenTelemetry.Resources;
@@ -29,6 +30,7 @@ public class TraceExporterBenchmarks
 {
     private readonly Activity activity;
     private readonly Batch<Activity> batch;
+    private readonly Batch<Activity> batchWithManyAttributes;
     private readonly MsgPackTraceExporter exporter;
     private readonly TracerProvider tracerProvider;
     private readonly ActivitySource activitySource = new("OpenTelemetry.Exporter.Geneva.Benchmark");
@@ -37,7 +39,8 @@ public class TraceExporterBenchmarks
     {
         Activity.DefaultIdFormat = ActivityIdFormat.W3C;
 
-        this.batch = this.CreateBatch();
+        this.batch = this.CreateBatch(1);
+        this.batchWithManyAttributes = this.CreateBatch(10000);
 
         #region Create activity to be used for Serialize and Export benchmark methods
         var activityListener = new ActivityListener
@@ -61,10 +64,12 @@ public class TraceExporterBenchmarks
         activityListener.Dispose();
         #endregion
 
+        string connectionString = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "EtwSession=OpenTelemetry" : "Endpoint=unix:///dev/null";
+
         this.exporter = new MsgPackTraceExporter(
             new GenevaExporterOptions
             {
-                ConnectionString = "EtwSession=OpenTelemetry",
+                ConnectionString = connectionString,
                 PrepopulatedFields = new Dictionary<string, object>
                 {
                     ["cloud.role"] = "BusyWorker",
@@ -79,7 +84,7 @@ public class TraceExporterBenchmarks
             .AddSource(this.activitySource.Name)
             .AddGenevaTraceExporter(options =>
             {
-                options.ConnectionString = "EtwSession=OpenTelemetry";
+                options.ConnectionString = connectionString;
                 options.PrepopulatedFields = new Dictionary<string, object>
                 {
                     ["cloud.role"] = "BusyWorker",
@@ -94,6 +99,12 @@ public class TraceExporterBenchmarks
     public void ExportActivity()
     {
         this.exporter.Export(this.batch);
+    }
+
+    [Benchmark]
+    public void ExportActivityWithManyAttributes()
+    {
+        this.exporter.Export(this.batchWithManyAttributes);
     }
 
     [Benchmark]
@@ -115,11 +126,12 @@ public class TraceExporterBenchmarks
         this.activity.Dispose();
         this.activitySource.Dispose();
         this.batch.Dispose();
+        this.batchWithManyAttributes.Dispose();
         this.exporter.Dispose();
         this.tracerProvider.Dispose();
     }
 
-    private Batch<Activity> CreateBatch()
+    private Batch<Activity> CreateBatch(int attributeCopies)
     {
         using var batchGeneratorExporter = new BatchGeneratorExporter();
         using var tracerProvider = Sdk.CreateTracerProviderBuilder()
@@ -130,8 +142,12 @@ public class TraceExporterBenchmarks
 
         using (var activity = this.activitySource.StartActivity("Benchmark")!)
         {
-            activity.SetTag("tagString", "value");
-            activity.SetTag("tagInt", 100);
+            for (int i = 0; i < attributeCopies; i++)
+            {
+                activity.SetTag($"tagString{i}", "value");
+                activity.SetTag($"tagInt{i}", 100);
+            }
+
             activity.SetStatus(ActivityStatusCode.Error);
         }
 

@@ -58,16 +58,25 @@ internal sealed class MsgPackTraceExporter : MsgPackExporter, IDisposable
 
     internal readonly Resource Resource;
 
-    internal readonly ThreadLocal<Dictionary<string, object>> PartCResourceAttributes = new();
+    internal readonly Dictionary<string, object> PrepopulatedFields = [];
+    internal readonly Dictionary<string, object> PrepopulatedPartCFields = [];
 
 #if NET
-    internal readonly FrozenSet<string>? CustomFields;
+    // This set is null if every user-provided field should be its own dedicated field in part C
+    // Otherwise, it's the set of fields which should be their own dedicated field in part C
+    internal readonly FrozenSet<string>? FieldsMoveToDedicated;
 
-    internal readonly FrozenSet<string>? DedicatedFields;
+    // This set contains all the fields that should be dropped and not copied to the message pack payload
+    // Usually because they are processed a different way (eg., mapped to another field)
+    internal readonly FrozenSet<string> IgnoredFields;
 #else
-    internal readonly HashSet<string>? CustomFields;
+    // This set is null if every user-provided field should be its own dedicated field in part C
+    // Otherwise, it's the set of fields which should be their own dedicated field in part C
+    internal readonly HashSet<string>? FieldsMoveToDedicated;
 
-    internal readonly HashSet<string>? DedicatedFields;
+    // This set contains all the fields that should be dropped and not copied to the message pack payload
+    // Usually because they are processed a different way (eg., mapped to another field)
+    internal readonly HashSet<string> IgnoredFields;
 #endif
 
     private const int BUFFER_SIZE = 65360; // the maximum ETW payload (inclusive)
@@ -126,51 +135,97 @@ internal sealed class MsgPackTraceExporter : MsgPackExporter, IDisposable
                 throw new NotSupportedException($"Protocol '{connectionStringBuilder.Protocol}' is not supported");
         }
 
+        var ignoredFields = new HashSet<string>(StringComparer.Ordinal);
+
         // TODO: Validate custom fields (reserved name? etc).
         if (options.CustomFields != null)
         {
-            var customFields = new HashSet<string>(StringComparer.Ordinal);
-            var dedicatedFields = new HashSet<string>(StringComparer.Ordinal);
+            var fieldsMoveToDedicated = new HashSet<string>(StringComparer.Ordinal);
 
-            // Seed customFields with Span PartB
-            customFields.Add("azureResourceProvider");
-            dedicatedFields.Add("azureResourceProvider");
-
-            foreach (var name in CS40_PART_B_MAPPING.Values)
-            {
-                customFields.Add(name);
-                dedicatedFields.Add(name);
-            }
-
+            // Anything marked as a CustomField needs to be taken out of the user-provided property bag and turned into its own field
             foreach (var name in options.CustomFields)
             {
-                customFields.Add(name);
-                dedicatedFields.Add(name);
+                fieldsMoveToDedicated.Add(name);
             }
 
+            // azureResourceProvider might be provided as a tag, but it should always be a dedicated field
+            fieldsMoveToDedicated.Add("azureResourceProvider");
+
 #if NET
-            this.CustomFields = customFields.ToFrozenSet(StringComparer.Ordinal);
+            this.FieldsMoveToDedicated = fieldsMoveToDedicated.ToFrozenSet(StringComparer.Ordinal);
 #else
-            this.CustomFields = customFields;
+            this.FieldsMoveToDedicated = fieldsMoveToDedicated;
+#endif
+        }
+
+        // I'm not sure of the logic of this
+        // I think it means that the customer cannot provide any field which would map to something in part B
+        // but why not, what's the issue, as long as it doesn't collide?
+        foreach (var name in CS40_PART_B_MAPPING.Values)
+        {
+            ignoredFields.Add(name);
+        }
+
+        // these fields are handled separately by IfTagMatchesStatusOrStatusDescription, so should not be copied as-is
+        ignoredFields.Add("otel.status_code");
+        ignoredFields.Add("otel.status_description");
+
+        // these fields are sourced from the activity itself and don't make sense to copy
+        ignoredFields.Add(Schema.V40.PartA.Time);
+        ignoredFields.Add(Schema.V40.PartA.Extensions.Dt.TraceId);
+        ignoredFields.Add(Schema.V40.PartA.Extensions.Dt.SpanId);
+        ignoredFields.Add(Schema.V40.PartBSpan.Name);
+        ignoredFields.Add(Schema.V40.PartBSpan.Kind);
+        ignoredFields.Add(Schema.V40.PartBSpan.StartTime);
+        ignoredFields.Add(Schema.V40.PartBSpan.Success);
+        ignoredFields.Add(Schema.V40.PartBSpan.ParentId);
+        ignoredFields.Add(Schema.V40.PartBSpan.TraceState);
+        ignoredFields.Add(Schema.V40.PartBSpan.Links);
+        ignoredFields.Add(Schema.V40.PartBSpan.LinksEntry.ToTraceId);
+        ignoredFields.Add(Schema.V40.PartBSpan.LinksEntry.ToSpanId);
+
+#if NET
+        this.IgnoredFields = ignoredFields.ToFrozenSet(StringComparer.Ordinal);
+#else
+        this.IgnoredFields = ignoredFields;
 #endif
 
-            foreach (var name in CS40_PART_B_MAPPING.Keys)
+        this.PrepopulatedFields.Add(Schema.V40.PartA.Name, partAName);
+
+        // options.PrepopulatedFields takes precedence. By inserting resource attributes first and prepopulatedFields second,
+        // any duplicates in prepopulated fields will overwrite resource attributes in type C.
+        foreach (var field in resource.Attributes)
+        {
+            if (field.Value is string resourceValue)
             {
-                dedicatedFields.Add(name);
+                switch (field.Key)
+                {
+                    // "known" fields are promoted to part A extensions and renamed
+                    case "service.name":
+                        this.PrepopulatedFields.Add(Schema.V40.PartA.Extensions.Cloud.Role, field.Value);
+                        break;
+                    case "service.instanceId":
+                        this.PrepopulatedFields.Add(Schema.V40.PartA.Extensions.Cloud.RoleInstance, field.Value);
+                        break;
+                    case "statusMessage":
+                        // this has a special meaning in part C, so ignore it
+                        break;
+                    default:
+                        // otherwise dump it in part C
+                        this.PrepopulatedPartCFields.Add(field.Key, field.Value);
+                        break;
+                }
             }
+        }
 
-            dedicatedFields.Add("otel.status_code");
-            dedicatedFields.Add("otel.status_description");
-
-#if NET
-            this.DedicatedFields = dedicatedFields.ToFrozenSet(StringComparer.Ordinal);
-#else
-            this.DedicatedFields = dedicatedFields;
-#endif
+        foreach (var field in options.PrepopulatedFields)
+        {
+            this.PrepopulatedFields.Add(field.Key, field.Value);
         }
 
         this.shouldIncludeTraceState = options.IncludeTraceStateForSpan;
 
+        // this is a working buffer used for the prologue and epilogue
         var buffer = new byte[BUFFER_SIZE];
 
         var cursor = 0;
@@ -197,22 +252,12 @@ internal sealed class MsgPackTraceExporter : MsgPackExporter, IDisposable
         cursor = MessagePackSerializer.WriteMapHeader(buffer, cursor, ushort.MaxValue); // Note: always use Map16 for perf consideration
         this.mapSizePatchIndex = cursor - 2;
 
-        this.prepopulatedFieldsCount = 0;
-
-        // TODO: Do we support PartB as well?
-        // Part A - core envelope
-        cursor = AddPartAField(buffer, cursor, Schema.V40.PartA.Name, partAName);
-        this.prepopulatedFieldsCount += 1;
-
-        foreach (var entry in options.PrepopulatedFields)
-        {
-            var value = entry.Value;
-            cursor = AddPartAField(buffer, cursor, entry.Key, value);
-            this.prepopulatedFieldsCount += 1;
-        }
+        // Part A fields can start directly after this prologue we just generated
 
         this.bufferPrologue = new byte[cursor - 0];
         System.Buffer.BlockCopy(buffer, 0, this.bufferPrologue, 0, cursor - 0);
+
+        // Now generate the epilogue
 
         cursor = MessagePackSerializer.Serialize(buffer, 0, new Dictionary<string, object> { { "TimeFormat", "DateTime" } });
 
@@ -267,7 +312,6 @@ internal sealed class MsgPackTraceExporter : MsgPackExporter, IDisposable
             (this.dataTransport as IDisposable)?.Dispose();
             this.Buffer.Dispose();
             this.HttpUrlParts.Dispose();
-            this.PartCResourceAttributes.Dispose();
         }
         catch (Exception ex)
         {
@@ -338,40 +382,17 @@ internal sealed class MsgPackTraceExporter : MsgPackExporter, IDisposable
         var tsEnd = tsBegin + activity.Duration.Ticks;
         var dtEnd = new DateTime(tsEnd, DateTimeKind.Utc);
 
-        string? serviceName = null;
-        string? serviceInstanceId = null;
-        if (this.PartCResourceAttributes.Value == null)
+        foreach (var entry in this.PrepopulatedFields)
         {
-            this.PartCResourceAttributes.Value = new();
-        }
-
-        var partCResourceAttributes = this.PartCResourceAttributes.Value;
-        partCResourceAttributes.Clear();
-
-        foreach (var resourceAttribute in this.Resource.Attributes)
-        {
-            if (resourceAttribute.Value is string resourceValue)
+            var tagWouldBeMovedToOwnField = this.FieldsMoveToDedicated == null || this.FieldsMoveToDedicated.Contains(entry.Key);
+            if (tagWouldBeMovedToOwnField && activity.GetTagItem(entry.Key) != null)
             {
-                switch (resourceAttribute.Key)
-                {
-                    case "service.name":
-                        serviceName = resourceValue;
-                        continue;
-                    case "service.instanceId":
-                        serviceInstanceId = resourceValue;
-                        continue;
-                    case "statusMessage":
-                        // this has a special meaning in part C, so ignore it
-                        continue;
-                }
+                // If the user provided a field which would turn into its own field, then it takes precedence over the prepopulatedField
+                continue;
             }
 
-            // Any resource attribute that's not a string or a mapped value
-            // will end up in part C if there isn't another part C property with the same key.
-            // This dictionary to keep track of the remaining resource attributes may result in
-            // an allocation if the dictionary needs to expand, but we have to calculate
-            // the set difference between resource attribute values and tags.
-            partCResourceAttributes[resourceAttribute.Key] = resourceAttribute.Value;
+            cursor = AddPartAField(buffer, cursor, entry.Key, entry.Value);
+            cntFields += 1;
         }
 
         MessagePackSerializer.WriteTimestamp96(buffer, this.timestampPatchIndex, tsEnd);
@@ -389,20 +410,6 @@ internal sealed class MsgPackTraceExporter : MsgPackExporter, IDisposable
 
         cursor = AddPartAField(buffer, cursor, Schema.V40.PartA.Extensions.Dt.SpanId, activity.Context.SpanId.ToHexString());
         cntFields += 1;
-        #endregion
-
-        #region Part A - cloud extension
-        if (!string.IsNullOrEmpty(serviceName))
-        {
-            cursor = AddPartAField(buffer, cursor, Schema.V40.PartA.Extensions.Cloud.Role, serviceName);
-            cntFields += 1;
-        }
-
-        if (!string.IsNullOrEmpty(serviceInstanceId))
-        {
-            cursor = AddPartAField(buffer, cursor, Schema.V40.PartA.Extensions.Cloud.RoleInstance, serviceInstanceId);
-            cntFields += 1;
-        }
         #endregion
 
         #region Part B Span - required fields
@@ -517,7 +524,7 @@ internal sealed class MsgPackTraceExporter : MsgPackExporter, IDisposable
             {
                 continue;
             }
-            else if (this.CustomFields == null || this.CustomFields.Contains(entry.Key))
+            else if (this.FieldsMoveToDedicated == null || this.FieldsMoveToDedicated.Contains(entry.Key))
             {
                 // TODO: the above null check can be optimized and avoided inside foreach.
                 cursor = MessagePackSerializer.SerializeUnicodeString(buffer, cursor, entry.Key);
@@ -535,7 +542,7 @@ internal sealed class MsgPackTraceExporter : MsgPackExporter, IDisposable
 
         foreach (var entry in partCResourceAttributes)
         {
-            if (this.CustomFields == null || this.CustomFields.Contains(entry.Key))
+            if (this.FieldsMoveToDedicated == null || this.FieldsMoveToDedicated.Contains(entry.Key))
             {
                 cursor = MessagePackSerializer.SerializeUnicodeString(buffer, cursor, entry.Key);
                 cursor = MessagePackSerializer.Serialize(buffer, cursor, entry.Value);

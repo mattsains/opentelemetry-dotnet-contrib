@@ -85,5 +85,22 @@ internal static class Schema
                 }
             }
         }
+
+        internal static class PartBSpan
+        {
+            internal const string Name = "name";
+            internal const string Kind = "kind";
+            internal const string StartTime = "startTime";
+            internal const string Success = "success";
+            internal const string ParentId = "parentId";
+            internal const string TraceState = "traceState";
+            internal const string Links = "links";
+
+            internal static class LinksEntry
+            {
+                internal const string ToTraceId = "toTraceId";
+                internal const string ToSpanId = "toSpanId";
+            }
+        }
     }
 }
