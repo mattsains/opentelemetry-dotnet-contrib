@@ -664,14 +664,16 @@ public class GenevaLogExporterTests
             {
                 PrepopulatedFields = new Dictionary<string, object>
                 {
-                    ["cloud.role"] = "BusyWorker",
-                    ["cloud.roleInstance"] = "CY1SCH030021417",
                     ["cloud.roleVer"] = "9.0.15289.2",
                     ["prepopulated"] = "prepopulated field",
                 },
             };
 
-            var resource = ResourceBuilder.CreateEmpty().AddAttributes([new KeyValuePair<string, object>("resourceAttr", "from resource")]).Build();
+            var resource = ResourceBuilder.CreateEmpty().AddAttributes([
+                new KeyValuePair<string, object>("resourceAttr", "from resource"),
+                new KeyValuePair<string, object>("service.name", "BusyWorker"),
+                new KeyValuePair<string, object>("service.instanceId", "CY1SCH030021417")])
+                .Build();
 
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
@@ -1737,6 +1739,21 @@ public class GenevaLogExporterTests
             Assert.Equal(logRecord.Exception.Message, mapping["env_ex_msg"]);
         }
 
+        // Part A cloud extensions
+        var serviceNameField = resource.Attributes.FirstOrDefault(attr => attr.Key == "service.name");
+        if (serviceNameField.Key == "service.name" && !exporterOptions.PrepopulatedFields.ContainsKey("cloud.role"))
+        {
+            Assert.Contains("env_cloud_role", mapping);
+            Assert.Equal(serviceNameField.Value, mapping["env_cloud_role"]);
+        }
+
+        var serviceInstanceField = resource.Attributes.FirstOrDefault(attr => attr.Key == "service.instanceId");
+        if (serviceInstanceField.Key == "service.instanceId" && !exporterOptions.PrepopulatedFields.ContainsKey("cloud.roleInstance"))
+        {
+            Assert.Contains("env_cloud_roleInstance", mapping);
+            Assert.Equal(serviceInstanceField.Value, mapping["env_cloud_roleInstance"]);
+        }
+
         // Part B fields
 
         // `LogRecord.LogLevel` was marked Obsolete in https://github.com/open-telemetry/opentelemetry-dotnet/pull/4568
@@ -1810,6 +1827,12 @@ public class GenevaLogExporterTests
 
             foreach (var item in resource.Attributes)
             {
+                if (item.Key == "service.name" || item.Key == "service.instanceId")
+                {
+                    // these ones are already checked.
+                    continue;
+                }
+
                 if (exporterOptions.CustomFields == null || exporterOptions.CustomFields.Contains(item.Key))
                 {
                     // It should be found as a custom field
