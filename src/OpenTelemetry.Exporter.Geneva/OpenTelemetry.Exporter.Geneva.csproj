@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <PackageReference Include="OpenTelemetry" />
+    <PackageReference Include="MessagePack" />
     <PackageReference Include="System.Runtime.InteropServices.RuntimeInformation" Condition="'$([MSBuild]::GetTargetFrameworkIdentifier(`$(TargetFramework)`))' == '.NETFramework'" />
   </ItemGroup>
 

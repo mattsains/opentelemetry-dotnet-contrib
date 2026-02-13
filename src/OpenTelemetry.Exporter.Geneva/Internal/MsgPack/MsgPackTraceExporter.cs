@@ -79,6 +79,8 @@ internal sealed class MsgPackTraceExporter : MsgPackExporter, IDisposable
     private readonly string partAName;
     private readonly Func<Resource> resourceProvider;
 
+    private readonly bool enableCheckBeforeSend;
+
     private byte[]? bufferPrologue;
     private byte[]? bufferEpilogue;
     private int timestampPatchIndex;
@@ -94,6 +96,9 @@ internal sealed class MsgPackTraceExporter : MsgPackExporter, IDisposable
     {
         Guard.ThrowIfNull(options);
         Guard.ThrowIfNull(resourceProvider);
+
+        var checkBeforeSendEnv = Environment.GetEnvironmentVariable("GENEVA_DEBUG_CHECK_BEFORE_SEND");
+        this.enableCheckBeforeSend = (!string.IsNullOrEmpty(checkBeforeSendEnv)) && checkBeforeSendEnv == "true";
 
         this.resourceProvider = resourceProvider;
 
@@ -228,6 +233,13 @@ internal sealed class MsgPackTraceExporter : MsgPackExporter, IDisposable
             try
             {
                 var data = this.SerializeActivity(activity);
+
+                var validationError = MsgPackSanityChecker.CheckValidity(data);
+
+                if (validationError != null)
+                {
+                    throw new FormatException(validationError);
+                }
 
                 this.dataTransport.Send(data.Array!, data.Count);
             }
