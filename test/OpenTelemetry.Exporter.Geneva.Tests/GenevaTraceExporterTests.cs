@@ -3,6 +3,7 @@
 
 #nullable disable
 
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Sockets;
 using System.Reflection;
@@ -787,6 +788,143 @@ public class GenevaTraceExporterTests : IDisposable
                 Assert.Equal(connectionStringForNamedOptions, options.ConnectionString);
             })
             .Build();
+    }
+
+    [Fact]
+    public void EndToEndTest()
+    {
+        var path = GetRandomFilePath();
+        try
+        {
+            var endpoint = new UnixDomainSocketEndPoint(path);
+            using var server = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.IP);
+            server.Bind(endpoint);
+            server.Listen();
+
+            // Set the ActivitySourceName to the unique value of the test method name to avoid interference with
+            // the ActivitySource used by other unit tests.
+            var sourceName = GetTestMethodName();
+            using var tracerProvider = Sdk.CreateTracerProviderBuilder()
+                .SetSampler(new AlwaysOnSampler())
+                .AddSource(sourceName)
+                .AddGenevaTraceExporter(options =>
+                {
+                    options.ConnectionString = "Endpoint=unix:" + path;
+                    options.CustomFields = new List<string>
+                    {
+                        "Result",
+                        "SubType",
+                        "Metadata",
+                        "UserHash",
+                        "HealthCheckMarker",
+                        "ObsoleteCorrelationId",
+                        "ObsoleteTransactionId",
+                        "iteration",
+                    };
+                    options.PrepopulatedFields = new Dictionary<string, object>
+                    {
+                        ["Tenant"] = "tenant",
+                        ["Environment"] = "executionContext.EnvironmentName",
+                        ["Location"] = "executionContext.RegionName",
+                        ["Role"] = "role",
+                        ["RoleInstance"] = "roleInstance",
+                        ["DataCenter"] = "dataCenter",
+                    };
+                })
+                .Build();
+
+            // Emit trace and grab a copy of internal buffer for validation.
+            var source = new ActivitySource(sourceName);
+
+            ConcurrentBag<int> foundIterations = [];
+
+            List<Thread> threads = [];
+
+            for (int i = 0; i < 1000; i++)
+            {
+                int innerI = i;
+                var thread = new Thread(() =>
+                {
+                    using var activity = source.StartActivity("Foo", ActivityKind.Internal);
+                    activity.AddTag("iteration", innerI);
+                });
+                threads.Add(thread);
+                thread.Start();
+            }
+
+            var receiveThread = new Thread(() =>
+            {
+                while (true)
+                {
+                    var serverSocket = server.Accept();
+
+                    try
+                    {
+                        while (true)
+                        {
+                            byte[] buffer = new byte[102400];
+
+                            serverSocket.ReceiveTimeout = 10000;
+                            var receivedBytes = serverSocket.Receive(buffer);
+                            if (receivedBytes == 0)
+                            {
+                                break;
+                            }
+
+                            MessagePack.MessagePackReader messagePackReader = new MessagePack.MessagePackReader(buffer.AsSpan(0, receivedBytes).ToArray());
+
+                            while (!messagePackReader.End)
+                            {
+                                var fluentdData = MessagePack.MessagePackSerializer.Deserialize<object>(ref messagePackReader, MessagePack.Resolvers.ContractlessStandardResolver.Options);
+
+                                var TimeStampAndMappings = ((fluentdData as object[])[1] as object[])[0];
+                                var mapping = (TimeStampAndMappings as object[])[1] as Dictionary<object, object>;
+
+                                var iteration = mapping["iteration"] switch
+                                {
+                                    byte byteVal => byteVal,
+                                    ushort ushortVal => (int)ushortVal,
+                                    _ => throw new Exception("didn't expect that"),
+                                };
+
+                                Assert.DoesNotContain(iteration, foundIterations);
+                                foundIterations.Add(iteration);
+                            }
+                        }
+
+                        serverSocket.Close();
+                    }
+                    catch (SocketException e)
+                    {
+                        break;
+                    }
+                }
+            });
+            receiveThread.Start();
+
+            foreach (var thread in threads)
+            {
+                thread.Join();
+            }
+
+            receiveThread.Join();
+
+            Assert.Equal(1000, foundIterations.Count);
+        }
+        catch (Exception)
+        {
+            throw;
+        }
+        finally
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch
+            {
+            }
+        }
     }
 
     [Fact]
